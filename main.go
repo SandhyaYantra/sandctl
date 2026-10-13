@@ -77,6 +77,7 @@ type trafficRates struct {
 type diskSnapshot struct {
 	Mountpoint string
 	Filesystem string
+	Label      string
 	Total      uint64
 	Used       uint64
 	Free       uint64
@@ -150,6 +151,7 @@ type Model struct {
 	powerProfile       string
 	powerProfileOK     bool
 	powerProfileCursor int
+	showMonitor        bool
 	lastError          string
 
 	wifiNetworks []WiFiNetwork
@@ -247,7 +249,7 @@ func initialModel() Model {
 	return Model{
 		width:  80,
 		height: 24,
-		menu:   []string{"Audio Volume", "Brightness", "Wi-Fi", "Bluetooth", "Microphone", "Power Profile", "System Monitor"},
+		menu:   []string{"Audio Volume", "Brightness", "Wi-Fi", "Bluetooth", "Microphone", "Power Profile"},
 	}
 }
 
@@ -424,13 +426,14 @@ func collectSystemSnapshot() (systemSnapshot, error) {
 				}
 				continue
 			}
-			entry := diskSnapshot{Mountpoint: partition.Mountpoint, Filesystem: partition.Fstype, Total: usage.Total, Used: usage.Used, Free: usage.Free}
+			entry := diskSnapshot{Mountpoint: partition.Mountpoint, Filesystem: partition.Fstype, Label: storageDisplayName(partition.Mountpoint), Total: usage.Total, Used: usage.Used, Free: usage.Free}
 			snapshot.Disks = append(snapshot.Disks, entry)
 			if partition.Mountpoint == "/" {
 				snapshot.RootDiskTotal, snapshot.RootDiskUsed, snapshot.RootDiskFree = usage.Total, usage.Used, usage.Free
 			}
 		}
 	}
+	snapshot.Disks = append(snapshot.Disks, dynamicMountedStorageSnapshots()...)
 	if averages, err := load.Avg(); err == nil && averages != nil {
 		snapshot.Load1, snapshot.Load5, snapshot.Load15 = averages.Load1, averages.Load5, averages.Load15
 	}
@@ -460,6 +463,69 @@ func collectSystemSnapshot() (systemSnapshot, error) {
 		return snapshot, fmt.Errorf("system metrics unavailable: CPU: %v; memory: %v; disks: %s", cpuErr, memoryErr, strings.Join(diskErrors, "; "))
 	}
 	return snapshot, nil
+}
+
+func dynamicMountedStorageSnapshots() []diskSnapshot {
+	seen := map[string]struct{}{}
+	var entries []diskSnapshot
+	addEntry := func(mountpoint string) {
+		mountpoint = strings.TrimRight(mountpoint, "/")
+		if mountpoint == "" || mountpoint == "/" {
+			return
+		}
+		if _, exists := seen[mountpoint]; exists {
+			return
+		}
+		usage, err := disk.Usage(mountpoint)
+		if err != nil || usage == nil || usage.Total == 0 {
+			return
+		}
+		label := storageDisplayName(mountpoint)
+		entries = append(entries, diskSnapshot{
+			Mountpoint: mountpoint,
+			Filesystem: usage.Fstype,
+			Label:      label,
+			Total:      usage.Total,
+			Used:       usage.Used,
+			Free:       usage.Free,
+		})
+		seen[mountpoint] = struct{}{}
+	}
+	for _, base := range []string{"/run/media", "/run/user/1000/gvfs"} {
+		stat, err := os.Stat(base)
+		if err != nil || !stat.IsDir() {
+			continue
+		}
+		entriesInBase, err := os.ReadDir(base)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entriesInBase {
+			if entry.IsDir() {
+				addEntry(filepath.Join(base, entry.Name()))
+			}
+		}
+		if base == "/run/media" {
+			addEntry(base)
+		}
+	}
+	return entries
+}
+
+func storageDisplayName(mountpoint string) string {
+	base := strings.TrimSpace(filepath.Base(strings.TrimRight(mountpoint, "/")))
+	if base == "" || base == "." {
+		return "Storage"
+	}
+	if strings.Contains(base, "gvfs") || strings.Contains(base, "mtp") || strings.Contains(base, "android") {
+		return "Phone"
+	}
+	if strings.Contains(base, "run") {
+		return "USB"
+	}
+	base = strings.ReplaceAll(base, "_", " ")
+	base = strings.ReplaceAll(base, "-", " ")
+	return strings.TrimSpace(base)
 }
 
 func parseNetworkDeviceStatuses(output string) ([]networkDeviceStatus, error) {
@@ -826,7 +892,7 @@ func connectBluetoothCmd(device BluetoothDevice) tea.Cmd {
 }
 
 func systemTickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -834,8 +900,61 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = message.Width, message.Height
 	case tea.KeyMsg:
-		if message.String() == "ctrl+c" || m.screen == mainMenuScreen && message.String() == "q" {
+		key := strings.ToLower(message.String())
+		if key == "ctrl+c" || key == "q" {
 			return m, tea.Quit
+		}
+		if key == "m" && m.screen == monitorScreen {
+			m.monitorMemoryDetail = !m.monitorMemoryDetail
+			return m, nil
+		}
+		if key == "m" {
+			m.showMonitor = !m.showMonitor
+			if m.showMonitor {
+				m.screen = monitorScreen
+				m.monitorMemoryDetail = false
+				return m, readSystemCmd()
+			}
+			m.screen = mainMenuScreen
+			return m, nil
+		}
+		if key == "esc" {
+			if m.screen == wifiScreen {
+				m.screen = mainMenuScreen
+				return m, nil
+			}
+			if m.screen == bluetoothScreen {
+				m.screen = mainMenuScreen
+				return m, nil
+			}
+			if m.screen == monitorScreen {
+				m.screen = mainMenuScreen
+				m.showMonitor = false
+				return m, nil
+			}
+		}
+		if m.showMonitor {
+			switch key {
+			case "h", "left":
+				m.showMonitor = false
+				m.screen = mainMenuScreen
+				return m, nil
+			case "l", "right":
+				m.showMonitor = false
+				m.screen = mainMenuScreen
+				return m, nil
+			case "m":
+				m.showMonitor = false
+				m.screen = mainMenuScreen
+				return m, nil
+			case "u", "k", "up":
+				m.monitorMemoryDetail = false
+				return m, nil
+			case "d", "j", "down":
+				m.monitorMemoryDetail = true
+				return m, nil
+			}
+			return m, nil
 		}
 		switch m.screen {
 		case wifiScreen:
@@ -843,10 +962,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case bluetoothScreen:
 			return m.updateBluetooth(message)
 		case monitorScreen:
-			if message.String() == "esc" {
+			if key == "h" || key == "left" {
 				m.screen = mainMenuScreen
+				return m, nil
 			}
-			if message.String() == "m" {
+			if key == "m" {
 				m.monitorMemoryDetail = !m.monitorMemoryDetail
 			}
 			return m, nil
@@ -885,11 +1005,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.lastError = message.err.Error()
 		}
-		if m.screen == monitorScreen {
+		if m.showMonitor || m.screen == monitorScreen {
 			return m, systemTickCmd()
 		}
 	case tickMsg:
-		if m.screen == monitorScreen {
+		if m.showMonitor || m.screen == monitorScreen {
 			return m, readSystemCmd()
 		}
 	case wifiScanMsg:
@@ -990,38 +1110,49 @@ func (m *Model) applySnapshot(snapshot systemSnapshot) {
 }
 
 func (m Model) updateMainMenu(message tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch message.String() {
+	key := strings.ToLower(message.String())
+	switch key {
 	case "up", "k":
 		m.cursor = max(0, m.cursor-1)
 	case "down", "j":
 		m.cursor = min(len(m.menu)-1, m.cursor+1)
-	case "right", "+":
-		if m.cursor == 0 {
+	case "right", "l":
+		switch m.cursor {
+		case 0:
 			m.volumePercent = min(100, m.volumePercent+5)
 			m.volumeAvailable = true
 			return m, setVolumeCmd(m.volumePercent)
-		}
-		if m.cursor == 1 {
+		case 1:
 			m.brightness = min(100, m.brightness+5)
 			m.brightnessOK = true
 			return m, setBrightnessCmd("+")
-		}
-		if m.cursor == 5 {
+		case 2:
+			m.screen, m.wifiLoading, m.wifiError = wifiScreen, true, ""
+			return m, scanWiFiCmd()
+		case 3:
+			m.screen, m.bluetoothLoading = bluetoothScreen, true
+			return m, scanBluetoothCmd()
+		case 4:
+			return m, toggleMuteCmd("@DEFAULT_AUDIO_SOURCE@")
+		case 5:
 			m.powerProfileCursor = (m.powerProfileCursor + 1) % len(powerProfiles)
+			return m, setPowerProfileCmd(powerProfiles[m.powerProfileCursor])
 		}
-	case "left", "-":
-		if m.cursor == 0 {
+	case "left", "h":
+		switch m.cursor {
+		case 0:
 			m.volumePercent = max(0, m.volumePercent-5)
 			m.volumeAvailable = true
 			return m, setVolumeCmd(m.volumePercent)
-		}
-		if m.cursor == 1 {
+		case 1:
 			m.brightness = max(0, m.brightness-5)
 			m.brightnessOK = true
 			return m, setBrightnessCmd("-")
-		}
-		if m.cursor == 5 {
+		case 4:
+			return m, toggleMuteCmd("@DEFAULT_AUDIO_SOURCE@")
+		case 5:
 			m.powerProfileCursor = (m.powerProfileCursor + len(powerProfiles) - 1) % len(powerProfiles)
+			return m, setPowerProfileCmd(powerProfiles[m.powerProfileCursor])
 		}
 	case "enter":
 		if m.cursor == 0 {
@@ -1039,9 +1170,6 @@ func (m Model) updateMainMenu(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, toggleMuteCmd("@DEFAULT_AUDIO_SOURCE@")
 		}
 		if m.cursor == 5 {
-			return m, setPowerProfileCmd(powerProfiles[m.powerProfileCursor])
-		}
-		if m.cursor == 6 {
 			m.screen = monitorScreen
 			m.monitorMemoryDetail = false
 			return m, readSystemCmd()
@@ -1051,9 +1179,15 @@ func (m Model) updateMainMenu(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateWiFi(message tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := strings.ToLower(message.String())
 	if m.wifiDialog {
-		switch message.String() {
+		switch key {
 		case "esc":
+			if !m.wifiBusy {
+				m.wifiDialog = false
+				m.wifiMessage = ""
+			}
+		case "h", "left":
 			if !m.wifiBusy {
 				m.wifiDialog = false
 				m.wifiMessage = ""
@@ -1076,11 +1210,23 @@ func (m Model) updateWiFi(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.wifiBusy = true
 				return m, wifiActionCmd(wifiAction(m.wifiAction), m.wifiSelected)
 			}
+		case "right", "l":
+			if !m.wifiBusy && len(m.wifiNetworks) > 0 {
+				network := m.wifiNetworks[m.wifiCursor]
+				m.wifiSelected = network.SSID
+				if wifiAction(m.wifiAction) == wifiConnect && (m.wifiSelected == "" || m.wifiSelected == "--") {
+					m.wifiSelected = network.BSSID
+				}
+				m.wifiBusy = true
+				return m, wifiActionCmd(wifiAction(m.wifiAction), m.wifiSelected)
+			}
 		}
 		return m, nil
 	}
-	switch message.String() {
+	switch key {
 	case "esc":
+		m.screen = mainMenuScreen
+	case "h", "left":
 		m.screen = mainMenuScreen
 	case "up", "k":
 		m.wifiCursor = max(0, m.wifiCursor-1)
@@ -1098,13 +1244,21 @@ func (m Model) updateWiFi(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.wifiDialog, m.wifiAction, m.wifiMessage = true, int(wifiConnect), ""
 			m.wifiSelected = m.wifiNetworks[m.wifiCursor].SSID
 		}
+	case "right", "l":
+		if len(m.wifiNetworks) > 0 && !m.wifiLoading {
+			m.wifiDialog, m.wifiAction, m.wifiMessage = true, int(wifiConnect), ""
+			m.wifiSelected = m.wifiNetworks[m.wifiCursor].SSID
+		}
 	}
 	return m, nil
 }
 
 func (m Model) updateBluetooth(message tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch message.String() {
+	key := strings.ToLower(message.String())
+	switch key {
 	case "esc":
+		m.screen = mainMenuScreen
+	case "h", "left":
 		m.screen = mainMenuScreen
 	case "up", "k":
 		m.bluetoothCursor = max(0, m.bluetoothCursor-1)
@@ -1114,12 +1268,23 @@ func (m Model) updateBluetooth(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.bluetoothLoading && len(m.bluetoothDevices) > 0 {
 			return m, connectBluetoothCmd(m.bluetoothDevices[m.bluetoothCursor])
 		}
+	case "right", "l":
+		if !m.bluetoothLoading && len(m.bluetoothDevices) > 0 {
+			return m, connectBluetoothCmd(m.bluetoothDevices[m.bluetoothCursor])
+		}
 	}
 	return m, nil
 }
 
 func (m Model) View() string {
-	activeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
+	if m.showMonitor {
+		content := m.dashboardView(lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true))
+		if m.monitorMemoryDetail {
+			content = m.memoryDetailView(lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true))
+		}
+		return lipgloss.NewStyle().Width(m.width).Height(m.height).Padding(0, 1).Render(content)
+	}
+	activeStyle := lipgloss.NewStyle().Background(lipgloss.Color("8")).Foreground(lipgloss.Color("15")).Bold(true)
 	headerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true)
 	leftWidth, rightWidth := panelWidths(m.width)
 	height := max(1, m.height)
@@ -1157,52 +1322,68 @@ func panelWidths(width int) (int, int) {
 
 func borderedPanel(width, height int, content string) string {
 	width, height = max(1, width), max(1, height)
-	return lipgloss.NewStyle().Width(width).Height(height).MaxWidth(width).MaxHeight(height).Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8")).Render(content)
+	return lipgloss.NewStyle().
+		Width(width).
+		Height(height).
+		MaxWidth(width).
+		MaxHeight(height).
+		Padding(0, 1).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("8")).
+		Render(content)
 }
 
 func (m Model) menuView(activeStyle, headerStyle lipgloss.Style) string {
-	view := headerStyle.Render("CONTROL & MENU") + "\n\n"
+	var lines []string
+	lines = append(lines, headerStyle.Render("CONTROL MENU"))
 	for index, label := range m.menu {
+		entry := "  " + label
 		switch index {
 		case 0:
 			if m.volumeAvailable {
-				label += fmt.Sprintf(" [%d%%]", m.volumePercent)
+				entry += fmt.Sprintf("  [%d%%]", m.volumePercent)
 			} else {
-				label += " [--]"
+				entry += "  [--]"
 			}
 			if m.audioStateOK && m.speakerMuted {
-				label += " [MUTED]"
+				entry += "  [MUTED]"
 			}
 		case 1:
 			if m.brightnessOK {
-				label += fmt.Sprintf(" [%d%%]", m.brightness)
+				entry += fmt.Sprintf("  [%d%%]", m.brightness)
 			} else {
-				label += " [--]"
+				entry += "  [--]"
 			}
 		case 4:
 			if m.audioStateOK && m.micMuted {
-				label += " [MUTED]"
+				entry += "  [MUTED]"
 			} else if m.audioStateOK {
-				label += " [ON]"
+				entry += "  [ON]"
 			}
 		case 5:
 			if m.powerProfileOK {
-				label += " [" + m.powerProfile + "]"
+				entry += "  [" + m.powerProfile + "]"
 			} else {
-				label += " [--]"
+				entry += "  [--]"
 			}
 		}
 		if index == m.cursor {
-			view += activeStyle.Render("> "+label) + "\n"
+			entry = activeStyle.Render(entry)
 		} else {
-			view += "  " + label + "\n"
+			entry = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render(entry)
 		}
+		lines = append(lines, entry)
 	}
-	view += "\n\nUp/Down or j/k\nLeft/Right or +/-\nEnter: Select  q: Exit"
+	lines = append(lines, "")
+	lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("↑/↓  j/k  move"))
+	lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("←/→  h/l  act"))
+	lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("m     monitor"))
+	lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("q     quit"))
 	if m.lastError != "" {
-		view += "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(m.lastError)
+		lines = append(lines, "")
+		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true).Render(m.lastError))
 	}
-	return view
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) mainDetail(activeStyle, headerStyle lipgloss.Style) (string, string) {
@@ -1218,21 +1399,21 @@ func (m Model) mainDetail(activeStyle, headerStyle lipgloss.Style) (string, stri
 		if m.speakerMuted {
 			muteState = mutedStyle.Render("MUTED")
 		}
-		return "AUDIO", headerStyle.Render("Speaker output") + "\n\nVolume  " + volume + "\nMute    " + muteState + "\n\n←/→ or -/+ adjusts by 5%\nEnter toggles mute"
+		return "AUDIO", headerStyle.Render("Speaker output") + "\n\nVolume  " + volume + "\nMute    " + muteState + "\n\n←/→ or h/l adjusts by 5%"
 	case 1:
 		brightness := "Unavailable"
 		if m.brightnessOK {
 			brightness = fmt.Sprintf("%d%%", m.brightness)
 		}
-		return "BRIGHTNESS", headerStyle.Render("Display backlight") + "\n\nBrightness  " + brightness + "\n\n←/→ or -/+ adjusts by 5%"
+		return "BRIGHTNESS", headerStyle.Render("Display backlight") + "\n\nBrightness  " + brightness + "\n\n←/→ or h/l adjusts by 5%"
 	case 2:
-		content := headerStyle.Render("Available networks") + "\n\nPress Enter to scan for Wi-Fi networks."
+		content := headerStyle.Render("Available networks") + "\n\nRight/Left to scan or return."
 		if len(m.wifiNetworks) > 0 {
 			content = m.wifiView(activeStyle)
 		}
 		return "WI-FI", content
 	case 3:
-		content := headerStyle.Render("Paired devices") + "\n\nPress Enter to load paired Bluetooth devices."
+		content := headerStyle.Render("Paired devices") + "\n\nRight to connect or disconnect."
 		if len(m.bluetoothDevices) > 0 {
 			content = m.bluetoothView(activeStyle)
 		}
@@ -1245,7 +1426,7 @@ func (m Model) mainDetail(activeStyle, headerStyle lipgloss.Style) (string, stri
 				state = mutedStyle.Render("MUTED")
 			}
 		}
-		return "MICROPHONE", headerStyle.Render("Default input") + "\n\nMicrophone  " + state + "\n\nEnter toggles microphone mute"
+		return "MICROPHONE", headerStyle.Render("Default input") + "\n\nMicrophone  " + state + "\n\n←/→ or h/l toggles microphone"
 	case 5:
 		selected := powerProfiles[m.powerProfileCursor]
 		current := "Unavailable"
@@ -1260,48 +1441,56 @@ func (m Model) mainDetail(activeStyle, headerStyle lipgloss.Style) (string, stri
 			}
 			options.WriteString(line + "\n")
 		}
-		return "POWER PROFILE", headerStyle.Render("Power mode") + "\n\nCurrent  " + current + "\nSelected " + selected + "\n\n" + options.String() + "\n←/→ chooses, Enter applies"
+		return "POWER PROFILE", headerStyle.Render("Power mode") + "\n\nCurrent  " + current + "\nSelected " + selected + "\n\n" + options.String() + "\n←/→ or h/l cycles profile"
 	default:
-		return "SYSTEM MONITOR", headerStyle.Render("Live system dashboard") + "\n\nCPU per-core usage, detailed memory and disk usage, and network traffic are sampled only while this submenu is open.\n\nEnter opens the monitor\nM opens all memory metrics"
+		return "SYSTEM MONITOR", headerStyle.Render("Live system dashboard") + "\n\nPress M to toggle the fullscreen monitor."
 	}
 }
 
 func (m Model) dashboardView(headerStyle lipgloss.Style) string {
-	_, rightWidth := panelWidths(m.width)
-	boxWidth := max(1, rightWidth-4)
-	boxHeight := max(1, m.height-2)
-	if boxWidth < 12 || boxHeight < 26 {
-		return lipgloss.NewStyle().Width(boxWidth).Height(boxHeight).MaxWidth(boxWidth).MaxHeight(boxHeight).Align(lipgloss.Center, lipgloss.Center).Render("Increase terminal size to view the System Monitor")
+	monitorWidth := m.width
+	monitorHeight := m.height
+	if !m.showMonitor {
+		_, rightWidth := panelWidths(m.width)
+		monitorWidth = max(1, rightWidth-4)
+		monitorHeight = max(1, m.height-2)
+	}
+	if monitorWidth < 12 || monitorHeight < 26 {
+		return lipgloss.NewStyle().Width(monitorWidth).Height(monitorHeight).MaxWidth(monitorWidth).MaxHeight(monitorHeight).Align(lipgloss.Center, lipgloss.Center).Render("Increase terminal size to view the System Monitor")
 	}
 
-	clockHeight := max(9, boxHeight/5)
-	networkHeight := max(10, boxHeight/4)
-	if clockHeight+networkHeight > boxHeight-5 {
-		clockHeight, networkHeight = 9, 5
+	topHeight := int(math.Max(10, math.Floor(float64(monitorHeight)*0.65)))
+	bottomHeight := monitorHeight - topHeight
+	if bottomHeight < 8 {
+		bottomHeight = 8
+		topHeight = monitorHeight - bottomHeight
 	}
-	middleHeight := boxHeight - clockHeight - networkHeight
-	columnGap := 1
-	leftColumnWidth := (boxWidth - columnGap) / 2
-	rightColumnWidth := boxWidth - leftColumnWidth - columnGap
-	clockStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	now := time.Now()
-	clockContent := lipgloss.NewStyle().Width(max(1, boxWidth-4)).Align(lipgloss.Center).Render(now.Format("Monday, 02 January 2006") + "\n" + digitalClock(now, clockStyle))
-	clock := monitorBox(boxWidth, clockHeight, "CLOCK", clockContent)
-	middleLeft := monitorBox(leftColumnWidth, middleHeight, "CPU & GPU", monitorCPUGPUContent(m.snapshot, m.hasSnapshot, m.batteryChargingSince, m.batteryLastChargedAt))
-	stackGap := 1
-	stackHeight := middleHeight - stackGap
-	memoryHeight := stackHeight * 2 / 3
-	disksHeight := stackHeight - memoryHeight
-	middleRight := lipgloss.JoinVertical(lipgloss.Left,
-		monitorBox(rightColumnWidth, memoryHeight, monitorMemoryTitle(m.snapshot, m.hasSnapshot), monitorMemoryContent(m.snapshot, m.hasSnapshot)),
-		"",
-		monitorBox(rightColumnWidth, disksHeight, "DISKS /", monitorDiskContent(m.snapshot, m.hasSnapshot)),
-	)
-	middle := lipgloss.JoinHorizontal(lipgloss.Top, middleLeft, " ", middleRight)
-	networkContentHeight := max(1, networkHeight-4)
-	networkContent := monitorNetworkContent(m.snapshot, m.rxHistory, m.txHistory, m.hasSnapshot, max(1, boxWidth-4), networkContentHeight)
-	network := monitorBox(boxWidth, networkHeight, "NETWORK", networkContent)
-	return lipgloss.JoinVertical(lipgloss.Left, clock, middle, network)
+	if topHeight < 10 {
+		topHeight = 10
+	}
+
+	topRowWidth := monitorWidth
+	leftWidth := max(12, topRowWidth/2)
+	rightWidth := max(12, topRowWidth-leftWidth)
+	if leftWidth+rightWidth > topRowWidth {
+		rightWidth = topRowWidth - leftWidth
+	}
+	memoryHeight := topHeight / 2
+	diskHeight := topHeight - memoryHeight
+	if diskHeight < 8 {
+		diskHeight = topHeight - 8
+		memoryHeight = topHeight - diskHeight
+	}
+
+	cpuBox := monitorBox(leftWidth, topHeight, "CPU & GPU", monitorCPUGPUContent(m.snapshot, m.hasSnapshot, m.batteryChargingSince, m.batteryLastChargedAt))
+	memoryBox := monitorBox(rightWidth, memoryHeight, monitorMemoryTitle(m.snapshot, m.hasSnapshot), monitorMemoryContent(m.snapshot, m.hasSnapshot))
+	diskBox := monitorBox(rightWidth, diskHeight, "DISKS /", monitorDiskContent(m.snapshot, m.hasSnapshot))
+	middleRight := lipgloss.JoinVertical(lipgloss.Left, memoryBox, diskBox)
+	topRow := lipgloss.JoinHorizontal(lipgloss.Top, cpuBox, middleRight)
+
+	networkContent := monitorNetworkContent(m.snapshot, m.rxHistory, m.txHistory, m.hasSnapshot, max(1, monitorWidth-4), max(1, bottomHeight-4))
+	networkBox := monitorBox(monitorWidth, bottomHeight, "NETWORK", networkContent)
+	return lipgloss.JoinVertical(lipgloss.Left, topRow, networkBox)
 }
 
 func (m Model) memoryDetailView(headerStyle lipgloss.Style) string {
@@ -1321,7 +1510,7 @@ func (m Model) memoryDetailView(headerStyle lipgloss.Style) string {
 			lines = append(lines, left)
 		}
 	}
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("M: return to dashboard   Esc: exit System Monitor"))
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("M: return to dashboard"))
 	return strings.Join(lines, "\n")
 }
 
@@ -1440,11 +1629,21 @@ func displayDuration(value time.Duration, available bool) string {
 }
 
 func monitorBox(width, height int, title, content string) string {
+	width = max(1, width)
+	height = max(1, height)
 	innerWidth := max(1, width-4)
 	innerHeight := max(1, height-2)
 	content = lipgloss.NewStyle().MaxWidth(innerWidth).MaxHeight(max(1, innerHeight-1)).Render(content)
 	title = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render(title)
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1).Width(width).Height(height).MaxWidth(width).MaxHeight(height).Render(title + "\n" + content)
+	return lipgloss.NewStyle().
+		Width(width).
+		Height(height).
+		MaxWidth(width).
+		MaxHeight(height).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("8")).
+		Padding(0, 1).
+		Render(title + "\n" + content)
 }
 
 func monitorCPUGPUContent(snapshot systemSnapshot, available bool, chargingSince, lastChargedAt time.Time) string {
@@ -1555,23 +1754,42 @@ func monitorDiskContent(snapshot systemSnapshot, available bool) string {
 		return "Disk unavailable"
 	}
 	if len(snapshot.Disks) == 0 && snapshot.RootDiskTotal > 0 {
-		snapshot.Disks = []diskSnapshot{{Mountpoint: "/", Total: snapshot.RootDiskTotal, Used: snapshot.RootDiskUsed, Free: snapshot.RootDiskFree}}
+		snapshot.Disks = []diskSnapshot{{Mountpoint: "/", Label: "Root", Total: snapshot.RootDiskTotal, Used: snapshot.RootDiskUsed, Free: snapshot.RootDiskFree}}
 	}
 	if len(snapshot.Disks) == 0 {
 		return "No physical disks found"
 	}
-	lines := make([]string, 0, len(snapshot.Disks)*3)
+	lines := make([]string, 0, len(snapshot.Disks)*2)
 	for _, mounted := range snapshot.Disks {
 		if mounted.Total == 0 {
 			continue
 		}
 		percent := min(100, max(0, int(math.Round(float64(mounted.Used)/float64(mounted.Total)*100))))
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Render(mounted.Mountpoint), fmt.Sprintf("%d%% used  %s", percent, progressBar(percent, 8)), "")
+		label := mounted.Label
+		if label == "" {
+			label = filepath.Base(strings.TrimRight(mounted.Mountpoint, "/"))
+		}
+		if label == "" || label == "." {
+			label = "Storage"
+		}
+		if mounted.Mountpoint == "/" {
+			label = "Root FS"
+		}
+		path := mounted.Mountpoint
+		if path == "" {
+			path = label
+		}
+		line := fmt.Sprintf("%s %3d%% %s %s/%s", path, percent, progressBar(percent, 5), formatMemoryBytes(mounted.Used), formatMemoryBytes(mounted.Total))
+		lines = append(lines, line)
+		if path != "/" {
+			lines = append(lines, label)
+		}
+		lines = append(lines, "")
 	}
 	if len(lines) == 0 {
 		return "No disk usage available"
 	}
-	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	return strings.Join(lines, "\n")
 }
 
 func progressBar(percent, width int) string {
@@ -1788,20 +2006,20 @@ func (m Model) wifiView(activeStyle lipgloss.Style) string {
 	viewWidth := max(1, rightWidth-4)
 	viewHeight := max(1, m.height-4)
 	if m.wifiLoading {
-		return "Available networks\n\nScanning..."
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("AVAILABLE NETWORKS") + "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Scanning...")
 	}
 	if m.wifiError != "" {
-		return "Available networks\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(m.wifiError)
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("AVAILABLE NETWORKS") + "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render(m.wifiError)
 	}
 	if len(m.wifiNetworks) == 0 {
-		return "Available networks\n\nNo networks found."
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("AVAILABLE NETWORKS") + "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("No networks found.")
 	}
 	view := wifiTableView(m.wifiNetworks, m.wifiCursor, m.wifiOffset, viewWidth, viewHeight)
 	if m.wifiDialog {
 		return overlayWiFiDialog(view, wifiDialogView(m, activeStyle), viewWidth, viewHeight)
 	}
 	if m.wifiMessage != "" {
-		view += "\n" + m.wifiMessage + "\n"
+		view += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(m.wifiMessage) + "\n"
 	}
 	return view
 }
@@ -1825,7 +2043,7 @@ func wifiTableView(networks []WiFiNetwork, cursor, offset, width, height int) st
 	if cursor < offset {
 		offset = cursor
 	}
-	lines := []string{"Available networks", wifiTableRow(titles, widths, -1, cursor)}
+	lines := []string{lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("AVAILABLE NETWORKS"), wifiTableRow(titles, widths, -1, cursor)}
 	end := min(len(networks), offset+visibleRows)
 	for index := offset; index < end; index++ {
 		lines = append(lines, wifiTableRow(rows[index], widths, index, cursor))
@@ -1878,12 +2096,12 @@ func wifiTableRow(fields []string, widths []int, rowIndex, cursor int) string {
 		if rowIndex == -1 {
 			style = style.Foreground(lipgloss.Color("6")).Bold(true)
 		} else if rowIndex == cursor {
-			style = style.Background(lipgloss.Color("8")).Foreground(lipgloss.Color("0"))
+			style = style.Background(lipgloss.Color("8")).Foreground(lipgloss.Color("15")).Bold(true)
 		}
 		if rowIndex != -1 && index == 0 && value == "*" {
 			style = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true).Width(width)
 			if rowIndex == cursor {
-				style = style.Background(lipgloss.Color("8"))
+				style = style.Background(lipgloss.Color("8")).Foreground(lipgloss.Color("15"))
 			}
 		}
 		if rowIndex != -1 && index == 8 {
@@ -1901,14 +2119,14 @@ func wifiTableRow(fields []string, widths []int, rowIndex, cursor int) string {
 			}
 			style = style.Foreground(lipgloss.Color(color))
 			if rowIndex == cursor {
-				style = style.Background(lipgloss.Color("8"))
+				style = style.Background(lipgloss.Color("8")).Foreground(lipgloss.Color("15"))
 			}
 		}
 		cells[index] = style.Render(value)
 	}
-	separator := " "
+	separator := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(" ")
 	if rowIndex == cursor {
-		separator = lipgloss.NewStyle().Background(lipgloss.Color("8")).Render(separator)
+		separator = lipgloss.NewStyle().Background(lipgloss.Color("8")).Foreground(lipgloss.Color("15")).Render(" ")
 	}
 	return strings.Join(cells, separator)
 }
@@ -1964,36 +2182,39 @@ func wifiDialogView(m Model, activeStyle lipgloss.Style) string {
 	if m.wifiMessage != "" {
 		content += "\n" + m.wifiMessage + "\n"
 	}
-	content += "\nEsc: Close"
+	content += "\n←/→ or h/l controls"
 	_, rightWidth := panelWidths(m.width)
 	innerWidth := max(1, min(40, rightWidth-8))
 	return lipgloss.NewStyle().Width(innerWidth).MaxWidth(innerWidth).Padding(1, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("6")).Background(lipgloss.Color("0")).Render(content)
 }
 
 func (m Model) bluetoothView(activeStyle lipgloss.Style) string {
-	view := "Paired devices\n\n"
+	view := lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("PAIRED DEVICES") + "\n"
 	if m.bluetoothLoading {
-		return view + "Loading..."
+		return view + "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Loading...")
 	}
 	if len(m.bluetoothDevices) == 0 {
-		view += "No devices found.\n"
+		view += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("No devices found.") + "\n"
 	}
 	for index, device := range m.bluetoothDevices {
-		state := "[DISCONNECTED]"
+		stateColor := lipgloss.Color("1")
+		stateText := "OFF"
 		if device.Connected {
-			state = "[CONNECTED]"
+			stateColor = lipgloss.Color("2")
+			stateText = "ON"
 		}
+		state := lipgloss.NewStyle().Foreground(stateColor).Bold(true).Render("[" + stateText + "]")
 		line := fmt.Sprintf("%s  %s  %s", device.Name, device.MACAddress, state)
 		if index == m.bluetoothCursor {
-			view += activeStyle.Render("> "+line) + "\n"
+			view += "\n" + activeStyle.Render("  "+line)
 		} else {
-			view += "  " + line + "\n"
+			view += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("  "+line)
 		}
 	}
 	if m.bluetoothMessage != "" {
-		view += "\n" + m.bluetoothMessage + "\n"
+		view += "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render(m.bluetoothMessage)
 	}
-	return view + "\nEsc: Main Menu"
+	return view + "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("←/→  h/l  controls")
 }
 
 func main() {
