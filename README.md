@@ -11,12 +11,13 @@ A small terminal control center for Linux, written in Go. `sandctl` brings a few
 - Paired Bluetooth device list and connection through `bluetoothctl`.
 - Live system dashboard, refreshed every second:
   - Per-core CPU load and load averages.
-  - RAM usage details and a short memory history graph.
+  - Battery ASCII gauge, charge state and input power, battery temperature, system uptime, estimated time remaining, and last charging activity observed during the current `sandctl` session.
+  - RAM usage overview and a short memory history graph. Press `m` in System Monitor to inspect every memory field reported by gopsutil, including Linux cache/kernel, swap, commit, vmalloc, and huge-page metrics.
   - Root filesystem usage.
   - Network interface, local IP, traffic rates, totals, and traffic graphs.
   - Battery, temperature, and Intel GPU readings when the system exposes them.
 
-Some hardware metrics depend on available kernel interfaces and permissions. Missing readings are shown as unavailable; Intel GPU utilization may be estimated from clock frequency when direct telemetry cannot be read.
+Some hardware metrics depend on available kernel interfaces and permissions. Missing readings are shown as unavailable; Intel GPU utilization may be estimated from clock frequency when direct telemetry cannot be read. Linux does not provide a consistent historical last-charge timestamp, so `sandctl` records charging activity only while the app is open.
 
 ## Requirements
 

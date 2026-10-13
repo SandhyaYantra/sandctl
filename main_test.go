@@ -2,6 +2,8 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 func TestParseVolumeOutput(t *testing.T) {
@@ -186,8 +189,115 @@ func TestCollectSystemSnapshotUsesGopsutilMetrics(t *testing.T) {
 	if len(snapshot.CPUPercent) == 0 {
 		t.Fatal("gopsutil returned no per-core CPU samples")
 	}
-	if snapshot.RAMTotal == 0 || snapshot.RootDiskTotal == 0 {
+	if snapshot.RAMTotal == 0 || snapshot.Memory.Total == 0 || snapshot.RootDiskTotal == 0 {
 		t.Fatalf("gopsutil returned incomplete memory/disk snapshot: %+v", snapshot)
+	}
+}
+
+func TestReadBatteryDetailsFromSysfs(t *testing.T) {
+	batteryPath := filepath.Join(t.TempDir(), "BAT0")
+	if err := os.MkdirAll(batteryPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"type": "Battery\n", "capacity": "64\n", "status": "Charging\n", "temp": "317\n",
+		"power_now": "12500000\n", "energy_now": "32000000\n", "energy_full": "57000000\n",
+	} {
+		if err := os.WriteFile(filepath.Join(batteryPath, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := readBatteryDetails(filepath.Dir(batteryPath))
+	if got.Percent != 64 || !got.PercentOK || got.Status != "Charging" {
+		t.Fatalf("battery identity/status = %+v", got)
+	}
+	if got.PowerW != 12.5 || !got.PowerOK || got.TemperatureC != 31.7 || !got.TemperatureOK {
+		t.Fatalf("battery power/temperature = %+v", got)
+	}
+	if got.TimeLeft != 2*time.Hour || !got.TimeLeftOK {
+		t.Fatalf("charging time estimate = %s/%t, want 2h/true", got.TimeLeft, got.TimeLeftOK)
+	}
+	if err := os.Remove(filepath.Join(batteryPath, "energy_full")); err != nil {
+		t.Fatal(err)
+	}
+	got = readBatteryDetails(filepath.Dir(batteryPath))
+	if got.TimeLeftOK {
+		t.Fatalf("charging time estimate should be unavailable without energy_full: %+v", got)
+	}
+}
+
+func TestBatteryGaugeColorsAndDuration(t *testing.T) {
+	for _, test := range []struct {
+		percent int
+		color   string
+	}{{10, "1"}, {21, "3"}, {50, "3"}, {51, "2"}} {
+		if got := batteryColor(test.percent); got != test.color {
+			t.Errorf("batteryColor(%d) = %q, want %q", test.percent, got, test.color)
+		}
+	}
+	if got := displayDuration(26*time.Hour+3*time.Minute, true); got != "1d 02:03" {
+		t.Errorf("displayDuration() = %q, want %q", got, "1d 02:03")
+	}
+	if !strings.Contains(batteryGauge(75), "######--") {
+		t.Errorf("battery gauge has unexpected fill: %q", batteryGauge(75))
+	}
+}
+
+func TestSystemMonitorOpensFromMenuAndTogglesMemoryDetail(t *testing.T) {
+	model := initialModel()
+	for _, item := range model.menu {
+		if item == "Battery" {
+			t.Fatal("Battery should be shown inside System Monitor, not as a main-menu entry")
+		}
+	}
+	model.width, model.height, model.cursor = 100, 30, len(model.menu)-1
+	opened, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = opened.(Model)
+	if model.screen != monitorScreen || cmd == nil {
+		t.Fatal("System Monitor did not open and request an initial snapshot")
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	if !updated.(Model).monitorMemoryDetail {
+		t.Fatal("M did not enable detailed memory view inside System Monitor")
+	}
+}
+
+func TestMonitorBatteryDetailsAndMemoryMetrics(t *testing.T) {
+	started := time.Date(2026, 10, 12, 10, 0, 0, 0, time.UTC)
+	snapshot := systemSnapshot{
+		BatteryPercent: 75, BatteryOK: true, BatteryStatus: "Charging", BatteryPowerW: 12.5, BatteryPowerOK: true,
+		BatteryTempC: 31.7, BatteryTempOK: true, BatteryTimeLeft: 2 * time.Hour, BatteryTimeOK: true,
+		SystemUptime: 26 * time.Hour, SystemUptimeOK: true,
+	}
+	battery := strings.Join(monitorBatteryContent(snapshot, started, time.Time{}), "\n")
+	for _, expected := range []string{"75%", "IN 12.50W", "31.7C", "ETA 2h00", "Uptime 1d02h", "10:00"} {
+		if !strings.Contains(battery, expected) {
+			t.Errorf("monitor battery content missing %q", expected)
+		}
+	}
+	stats := mem.VirtualMemoryStat{
+		Total: 8 << 30, Used: 4 << 30, UsedPercent: 50, Available: 3 << 30, Free: 512 << 20,
+		Active: 2 << 30, Inactive: 1 << 30, Buffers: 128 << 20, Cached: 1 << 30,
+		SwapTotal: 2 << 30, SwapFree: 1 << 30, VmallocTotal: 4 << 30, VmallocChunk: 256 << 20,
+		HugePagesTotal: 8, HugePagesFree: 4, HugePageSize: 2 << 20, AnonHugePages: 64 << 20,
+	}
+	metrics := memoryMetrics(stats)
+	if len(metrics) != 37 {
+		t.Fatalf("memory metrics count = %d, want 37", len(metrics))
+	}
+	model := initialModel()
+	model.width, model.height, model.hasSnapshot = 120, 42, true
+	model.screen, model.monitorMemoryDetail = monitorScreen, true
+	model.snapshot.Memory = stats
+	detail := model.memoryDetailView(lipgloss.NewStyle())
+	for _, expected := range []string{"RAM total", "RAM used", "RAM available", "Vmalloc chunk", "Huge pages total", "Huge page size", "Anon huge pages", "M: return to dashboard"} {
+		if !strings.Contains(detail, expected) {
+			t.Errorf("memory detail view missing %q", expected)
+		}
+	}
+	view := model.View()
+	if !strings.Contains(view, "Anon huge pages") || lipgloss.Width(view) != model.width || lipgloss.Height(view) != model.height {
+		t.Fatalf("expanded monitor memory view is incomplete or outside terminal bounds: %dx%d", lipgloss.Width(view), lipgloss.Height(view))
 	}
 }
 
@@ -198,12 +308,14 @@ func TestDashboardRendersDetailedSections(t *testing.T) {
 	model.hasSnapshot = true
 	model.snapshot = systemSnapshot{
 		CPUPercent: []float64{10, 20, 30, 40},
+		Memory:     mem.VirtualMemoryStat{Total: 8 << 30, Used: 4 << 30, UsedPercent: 50, Available: 4 << 30, Free: 512 << 20, Cached: 1 << 30, Active: 2 << 30, Inactive: 1 << 30, Buffers: 128 << 20, SwapTotal: 2 << 30, SwapFree: 1 << 30},
 		RAMTotal:   8 << 30, RAMUsed: 4 << 30, RAMAvailable: 4 << 30, RAMCached: 1 << 30, RAMFree: 512 << 20,
 		RootDiskTotal: 10 << 30, RootDiskUsed: 8 << 30, RootDiskFree: 2 << 30,
 		Disks: []diskSnapshot{{Mountpoint: "/", Total: 10 << 30, Used: 8 << 30, Free: 2 << 30}, {Mountpoint: "/run/media/user/usb", Total: 4 << 30, Used: 1 << 30, Free: 3 << 30}},
 		Load1: 1.25, Load5: 0.75, Load15: 0.5,
 		Interface: "wlan0", LocalIP: "192.168.1.5", NetworkOK: true,
-		BatteryPercent: 80, BatteryOK: true, TemperatureC: 50, TemperatureOK: true,
+		BatteryPercent: 80, BatteryOK: true, BatteryStatus: "Charging", BatteryPowerW: 12.5, BatteryPowerOK: true,
+		BatteryTempC: 31.7, BatteryTempOK: true, TemperatureC: 50, TemperatureOK: true,
 		NetworkDevices: []networkDeviceStatus{{Device: "wlan0", Type: "wifi", State: "connected", Connection: "Home Wi-Fi"}, {Device: "eth0", Type: "ethernet", State: "disconnected"}},
 		Traffic:        trafficRates{RXBytesPerSecond: 1024, TXBytesPerSecond: 512, TotalRX: 1 << 20, TotalTX: 512 << 10},
 	}
@@ -215,7 +327,7 @@ func TestDashboardRendersDetailedSections(t *testing.T) {
 	if got, want := lipgloss.Height(view), model.height-2; got != want {
 		t.Errorf("dashboard height = %d, want panel interior height %d", got, want)
 	}
-	for _, expected := range []string{"CPU PER CORE", "C0", "10%", "Load Avg", "Battery 80%", "Temperature 50.0 C", "MEMORY", "Available", "Cached", "DISKS /", "8.0 GiB", "/run/media/user/usb", "NETWORK", "DEVICE", "wlan0", "Home Wi-Fi", "disconnected", "Download", "Upload", "RX", "TX"} {
+	for _, expected := range []string{"CPU PER CORE", "C0", "10%", "Load Avg", "BATTERY / POWER", "80%", "12.50W", "31.7C", "MEMORY", "Available", "Cached", "DISKS /", "8.0 GiB", "/run/media/user/usb", "NETWORK", "DEVICE", "wlan0", "Home Wi-Fi", "disconnected", "Download", "Upload", "RX", "TX"} {
 		if !strings.Contains(view, expected) {
 			t.Errorf("dashboard missing %q", expected)
 		}
@@ -223,26 +335,29 @@ func TestDashboardRendersDetailedSections(t *testing.T) {
 	if strings.Index(view, "DEVICE") > strings.Index(view, "Download") {
 		t.Error("Network device status table should appear above traffic metrics")
 	}
-	if strings.Index(view, "Battery 80%") > strings.Index(view, "NETWORK") {
-		t.Error("battery/temperature summary should remain in CPU & GPU above Network")
+	if strings.Index(view, "BATTERY / POWER") > strings.Index(view, "NETWORK") {
+		t.Error("battery details should remain in CPU & GPU above Network")
 	}
 }
 
 func TestMonitorSectionsKeepVisualSpacing(t *testing.T) {
 	snapshot := systemSnapshot{
 		CPUPercent: []float64{20}, RAMTotal: 8 << 30, RAMUsed: 4 << 30, RAMAvailable: 4 << 30,
+		Memory:    mem.VirtualMemoryStat{Total: 8 << 30, Used: 4 << 30, Available: 4 << 30, Free: 512 << 20, Cached: 1 << 30, Active: 2 << 30, Inactive: 1 << 30, Buffers: 128 << 20, SwapTotal: 2 << 30, SwapFree: 1 << 30},
 		RAMCached: 1 << 30, RAMFree: 512 << 20, RootDiskTotal: 10 << 30, RootDiskUsed: 8 << 30, RootDiskFree: 2 << 30,
 		Disks:          []diskSnapshot{{Mountpoint: "/", Total: 10 << 30, Used: 8 << 30, Free: 2 << 30}, {Mountpoint: "/media/usb", Total: 4 << 30, Used: 1 << 30, Free: 3 << 30}},
 		BatteryPercent: 80, BatteryOK: true, TemperatureC: 50, TemperatureOK: true,
 	}
-	if !strings.Contains(monitorMemoryContent(snapshot, true), "\n\n") {
-		t.Error("Memory metrics should have a blank line between metric groups")
+	for _, expected := range []string{"Used", "Available", "Cached", "Active", "Swap", "M: all memory metrics"} {
+		if !strings.Contains(monitorMemoryContent(snapshot, true), expected) {
+			t.Errorf("Memory overview missing %q", expected)
+		}
 	}
 	if !strings.Contains(monitorDiskContent(snapshot, true), "\n\n") {
 		t.Error("Disk entries should have a blank line between mount points")
 	}
-	cpuView := monitorCPUGPUContent(snapshot, true)
-	if !strings.Contains(cpuView, "\n\n") || !strings.Contains(cpuView, "POWER / THERMAL") {
+	cpuView := monitorCPUGPUContent(snapshot, true, time.Time{}, time.Time{})
+	if !strings.Contains(cpuView, "\n\n") || !strings.Contains(cpuView, "BATTERY / POWER") {
 		t.Error("CPU & GPU should separate the battery/temperature section")
 	}
 }

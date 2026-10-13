@@ -91,6 +91,7 @@ type networkDeviceStatus struct {
 
 type systemSnapshot struct {
 	CPUPercent      []float64
+	Memory          mem.VirtualMemoryStat
 	RAMTotal        uint64
 	RAMUsed         uint64
 	RAMAvailable    uint64
@@ -105,6 +106,15 @@ type systemSnapshot struct {
 	Load15          float64
 	BatteryPercent  int
 	BatteryOK       bool
+	BatteryStatus   string
+	BatteryPowerW   float64
+	BatteryPowerOK  bool
+	BatteryTempC    float64
+	BatteryTempOK   bool
+	BatteryTimeLeft time.Duration
+	BatteryTimeOK   bool
+	SystemUptime    time.Duration
+	SystemUptimeOK  bool
 	TemperatureC    float64
 	TemperatureOK   bool
 	GPUUtilPercent  int
@@ -123,11 +133,12 @@ type systemSnapshot struct {
 }
 
 type Model struct {
-	menu   []string
-	cursor int
-	screen screenState
-	width  int
-	height int
+	menu                []string
+	cursor              int
+	screen              screenState
+	monitorMemoryDetail bool
+	width               int
+	height              int
 
 	volumePercent      int
 	volumeAvailable    bool
@@ -157,14 +168,16 @@ type Model struct {
 	bluetoothLoading bool
 	bluetoothMessage string
 
-	snapshot      systemSnapshot
-	hasSnapshot   bool
-	previousIO    networkCounters
-	previousIOAt  time.Time
-	hasPreviousIO bool
-	ramHistory    []int
-	rxHistory     []float64
-	txHistory     []float64
+	snapshot             systemSnapshot
+	hasSnapshot          bool
+	previousIO           networkCounters
+	previousIOAt         time.Time
+	hasPreviousIO        bool
+	ramHistory           []int
+	rxHistory            []float64
+	txHistory            []float64
+	batteryChargingSince time.Time
+	batteryLastChargedAt time.Time
 }
 
 type volumeMsg struct {
@@ -388,6 +401,7 @@ func collectSystemSnapshot() (systemSnapshot, error) {
 	}
 	memory, memoryErr := mem.VirtualMemory()
 	if memoryErr == nil && memory != nil {
+		snapshot.Memory = *memory
 		snapshot.RAMTotal = memory.Total
 		snapshot.RAMUsed = memory.Used
 		snapshot.RAMAvailable = memory.Available
@@ -432,7 +446,13 @@ func collectSystemSnapshot() (systemSnapshot, error) {
 	if output, err := exec.Command("nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device").Output(); err == nil {
 		snapshot.NetworkDevices, _ = parseNetworkDeviceStatuses(string(output))
 	}
-	snapshot.BatteryPercent, snapshot.BatteryOK = readBattery()
+	battery := readBatteryDetails("/sys/class/power_supply")
+	snapshot.BatteryPercent, snapshot.BatteryOK = battery.Percent, battery.PercentOK
+	snapshot.BatteryStatus = battery.Status
+	snapshot.BatteryPowerW, snapshot.BatteryPowerOK = battery.PowerW, battery.PowerOK
+	snapshot.BatteryTempC, snapshot.BatteryTempOK = battery.TemperatureC, battery.TemperatureOK
+	snapshot.BatteryTimeLeft, snapshot.BatteryTimeOK = battery.TimeLeft, battery.TimeLeftOK
+	snapshot.SystemUptime, snapshot.SystemUptimeOK = readSystemUptime("/proc/uptime")
 	snapshot.TemperatureC, snapshot.TemperatureOK = readTemperature()
 	snapshot.GPUUtilPercent, snapshot.GPUUtilOK, snapshot.GPUUtilEstimate, snapshot.GPUFrequencyMHz, snapshot.GPUFrequencyOK, snapshot.GPUPowerWatts, snapshot.GPUPowerOK = readGPU()
 
@@ -509,16 +529,99 @@ func localIPForInterface(name string) string {
 	return "N/A"
 }
 
-func readBattery() (int, bool) {
-	for _, path := range []string{"/sys/class/power_supply/BAT0/capacity", "/sys/class/power_supply/BAT1/capacity"} {
-		if data, err := os.ReadFile(path); err == nil {
-			value, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if parseErr == nil && value >= 0 && value <= 100 {
-				return value, true
+type batteryMetrics struct {
+	Percent       int
+	PercentOK     bool
+	Status        string
+	PowerW        float64
+	PowerOK       bool
+	TemperatureC  float64
+	TemperatureOK bool
+	TimeLeft      time.Duration
+	TimeLeftOK    bool
+}
+
+func readBatteryDetails(powerSupplyPath string) batteryMetrics {
+	var result batteryMetrics
+	batteries, _ := filepath.Glob(filepath.Join(powerSupplyPath, "BAT*"))
+	for _, batteryPath := range batteries {
+		if readSysfsString(filepath.Join(batteryPath, "type")) != "Battery" {
+			continue
+		}
+		if percent, ok := readSysfsInt(filepath.Join(batteryPath, "capacity")); ok && percent >= 0 && percent <= 100 {
+			result.Percent, result.PercentOK = percent, true
+		}
+		result.Status = readSysfsString(filepath.Join(batteryPath, "status"))
+		if temperature, ok := readSysfsInt(filepath.Join(batteryPath, "temp")); ok {
+			result.TemperatureC, result.TemperatureOK = float64(temperature)/10, true
+		}
+		if power, ok := readSysfsInt64(filepath.Join(batteryPath, "power_now")); ok {
+			result.PowerW, result.PowerOK = math.Abs(float64(power))/1_000_000, true
+		} else if current, currentOK := readSysfsInt64(filepath.Join(batteryPath, "current_now")); currentOK {
+			if voltage, voltageOK := readSysfsInt64(filepath.Join(batteryPath, "voltage_now")); voltageOK {
+				result.PowerW, result.PowerOK = math.Abs(float64(current)*float64(voltage))/1_000_000_000_000, true
 			}
 		}
+		energyNow, energyOK := readSysfsInt64(filepath.Join(batteryPath, "energy_now"))
+		if !energyOK {
+			chargeNow, chargeOK := readSysfsInt64(filepath.Join(batteryPath, "charge_now"))
+			voltage, voltageOK := readSysfsInt64(filepath.Join(batteryPath, "voltage_now"))
+			if chargeOK && voltageOK {
+				energyNow, energyOK = chargeNow*voltage/1_000_000, true
+			}
+		}
+		if result.PowerOK && result.PowerW > 0 && energyOK {
+			var energyRemaining int64
+			estimateOK := false
+			if result.Status == "Charging" {
+				if energyFull, ok := readSysfsInt64(filepath.Join(batteryPath, "energy_full")); ok && energyFull >= energyNow {
+					energyRemaining = energyFull - energyNow
+					estimateOK = true
+				}
+			} else if result.Status == "Discharging" {
+				energyRemaining, estimateOK = energyNow, true
+			}
+			if estimateOK {
+				hours := float64(energyRemaining) / (result.PowerW * 1_000_000)
+				if hours >= 0 && hours < 1000 {
+					result.TimeLeft = time.Duration(hours * float64(time.Hour))
+					result.TimeLeftOK = true
+				}
+			}
+		}
+		return result
 	}
-	return 0, false
+	return result
+}
+
+func readSysfsString(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func readSysfsInt(path string) (int, bool) {
+	value, err := readSysfsInt64(path)
+	return int(value), err
+}
+
+func readSysfsInt64(path string) (int64, bool) {
+	value, err := strconv.ParseInt(readSysfsString(path), 10, 64)
+	return value, err == nil
+}
+
+func readSystemUptime(path string) (time.Duration, bool) {
+	fields := strings.Fields(readSysfsString(path))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 {
+		return 0, false
+	}
+	return time.Duration(seconds * float64(time.Second)), true
 }
 
 func readTemperature() (float64, bool) {
@@ -743,6 +846,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if message.String() == "esc" {
 				m.screen = mainMenuScreen
 			}
+			if message.String() == "m" {
+				m.monitorMemoryDetail = !m.monitorMemoryDetail
+			}
 			return m, nil
 		default:
 			return m.updateMainMenu(message)
@@ -837,6 +943,17 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) applySnapshot(snapshot systemSnapshot) {
+	if snapshot.SampledAt.IsZero() {
+		snapshot.SampledAt = time.Now()
+	}
+	if snapshot.BatteryStatus == "Charging" {
+		if m.batteryChargingSince.IsZero() {
+			m.batteryChargingSince = snapshot.SampledAt
+		}
+	} else if !m.batteryChargingSince.IsZero() {
+		m.batteryLastChargedAt = snapshot.SampledAt
+		m.batteryChargingSince = time.Time{}
+	}
 	if snapshot.NetworkOK && m.hasPreviousIO {
 		elapsed := snapshot.SampledAt.Sub(m.previousIOAt).Seconds()
 		if elapsed > 0 && snapshot.Interface == m.snapshot.Interface {
@@ -926,6 +1043,7 @@ func (m Model) updateMainMenu(message tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.cursor == 6 {
 			m.screen = monitorScreen
+			m.monitorMemoryDetail = false
 			return m, readSystemCmd()
 		}
 	}
@@ -1014,7 +1132,11 @@ func (m Model) View() string {
 	case bluetoothScreen:
 		rightTitle, rightContent = "BLUETOOTH", m.bluetoothView(activeStyle)
 	case monitorScreen:
-		right = borderedPanel(rightWidth, height, m.dashboardView(headerStyle))
+		content := m.dashboardView(headerStyle)
+		if m.monitorMemoryDetail {
+			content = m.memoryDetailView(headerStyle)
+		}
+		right = borderedPanel(rightWidth, height, content)
 	}
 	if right == "" {
 		right = borderedPanel(rightWidth, height, headerStyle.Render(rightTitle)+"\n\n"+rightContent)
@@ -1140,7 +1262,7 @@ func (m Model) mainDetail(activeStyle, headerStyle lipgloss.Style) (string, stri
 		}
 		return "POWER PROFILE", headerStyle.Render("Power mode") + "\n\nCurrent  " + current + "\nSelected " + selected + "\n\n" + options.String() + "\n←/→ chooses, Enter applies"
 	default:
-		return "SYSTEM MONITOR", headerStyle.Render("Live system dashboard") + "\n\nCPU per-core usage, detailed memory and disk usage, and network traffic are sampled only while this submenu is open.\n\nEnter opens the monitor"
+		return "SYSTEM MONITOR", headerStyle.Render("Live system dashboard") + "\n\nCPU per-core usage, detailed memory and disk usage, and network traffic are sampled only while this submenu is open.\n\nEnter opens the monitor\nM opens all memory metrics"
 	}
 }
 
@@ -1165,10 +1287,10 @@ func (m Model) dashboardView(headerStyle lipgloss.Style) string {
 	now := time.Now()
 	clockContent := lipgloss.NewStyle().Width(max(1, boxWidth-4)).Align(lipgloss.Center).Render(now.Format("Monday, 02 January 2006") + "\n" + digitalClock(now, clockStyle))
 	clock := monitorBox(boxWidth, clockHeight, "CLOCK", clockContent)
-	middleLeft := monitorBox(leftColumnWidth, middleHeight, "CPU & GPU", monitorCPUGPUContent(m.snapshot, m.hasSnapshot))
+	middleLeft := monitorBox(leftColumnWidth, middleHeight, "CPU & GPU", monitorCPUGPUContent(m.snapshot, m.hasSnapshot, m.batteryChargingSince, m.batteryLastChargedAt))
 	stackGap := 1
 	stackHeight := middleHeight - stackGap
-	memoryHeight := stackHeight / 2
+	memoryHeight := stackHeight * 2 / 3
 	disksHeight := stackHeight - memoryHeight
 	middleRight := lipgloss.JoinVertical(lipgloss.Left,
 		monitorBox(rightColumnWidth, memoryHeight, monitorMemoryTitle(m.snapshot, m.hasSnapshot), monitorMemoryContent(m.snapshot, m.hasSnapshot)),
@@ -1182,6 +1304,141 @@ func (m Model) dashboardView(headerStyle lipgloss.Style) string {
 	return lipgloss.JoinVertical(lipgloss.Left, clock, middle, network)
 }
 
+func (m Model) memoryDetailView(headerStyle lipgloss.Style) string {
+	if !m.hasSnapshot || m.snapshot.Memory.Total == 0 {
+		return headerStyle.Render("MEMORY DETAILS") + "\n\nMemory metrics unavailable."
+	}
+	_, rightWidth := panelWidths(m.width)
+	contentWidth := max(1, rightWidth-8)
+	cellWidth := max(12, (contentWidth-3)/2)
+	metrics := memoryMetrics(m.snapshot.Memory)
+	lines := []string{headerStyle.Render("MEMORY DETAILS  ·  Linux / gopsutil")}
+	for index := 0; index < len(metrics); index += 2 {
+		left := formatMemoryMetric(metrics[index], cellWidth)
+		if index+1 < len(metrics) {
+			lines = append(lines, left+" | "+formatMemoryMetric(metrics[index+1], cellWidth))
+		} else {
+			lines = append(lines, left)
+		}
+	}
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("M: return to dashboard   Esc: exit System Monitor"))
+	return strings.Join(lines, "\n")
+}
+
+type memoryMetric struct {
+	name  string
+	value uint64
+	text  string
+}
+
+func memoryMetrics(stats mem.VirtualMemoryStat) []memoryMetric {
+	usedPercent := stats.UsedPercent
+	if usedPercent == 0 && stats.Total > 0 {
+		usedPercent = float64(stats.Used) / float64(stats.Total) * 100
+	}
+	return []memoryMetric{
+		{name: "RAM total", value: stats.Total},
+		{name: "RAM used", value: stats.Used, text: fmt.Sprintf("%.0f%%", usedPercent)},
+		{name: "RAM available", value: stats.Available},
+		{name: "RAM free", value: stats.Free},
+		{name: "Active", value: stats.Active},
+		{name: "Inactive", value: stats.Inactive},
+		{name: "Wired", value: stats.Wired},
+		{name: "Laundry", value: stats.Laundry},
+		{name: "Buffers", value: stats.Buffers},
+		{name: "Cached", value: stats.Cached},
+		{name: "Writeback", value: stats.WriteBack},
+		{name: "Dirty", value: stats.Dirty},
+		{name: "Writeback tmp", value: stats.WriteBackTmp},
+		{name: "Shared", value: stats.Shared},
+		{name: "Slab", value: stats.Slab},
+		{name: "SReclaimable", value: stats.Sreclaimable},
+		{name: "SUnreclaim", value: stats.Sunreclaim},
+		{name: "Page tables", value: stats.PageTables},
+		{name: "Swap cached", value: stats.SwapCached},
+		{name: "Commit limit", value: stats.CommitLimit},
+		{name: "Committed AS", value: stats.CommittedAS},
+		{name: "High total", value: stats.HighTotal},
+		{name: "High free", value: stats.HighFree},
+		{name: "Low total", value: stats.LowTotal},
+		{name: "Low free", value: stats.LowFree},
+		{name: "Swap total", value: stats.SwapTotal},
+		{name: "Swap free", value: stats.SwapFree},
+		{name: "Mapped", value: stats.Mapped},
+		{name: "Vmalloc total", value: stats.VmallocTotal},
+		{name: "Vmalloc used", value: stats.VmallocUsed},
+		{name: "Vmalloc chunk", value: stats.VmallocChunk},
+		{name: "Huge pages total", value: stats.HugePagesTotal, text: "pages"},
+		{name: "Huge pages free", value: stats.HugePagesFree, text: "pages"},
+		{name: "Huge pages rsvd", value: stats.HugePagesRsvd, text: "pages"},
+		{name: "Huge pages surp", value: stats.HugePagesSurp, text: "pages"},
+		{name: "Huge page size", value: stats.HugePageSize},
+		{name: "Anon huge pages", value: stats.AnonHugePages},
+	}
+}
+
+func formatMemoryMetric(metric memoryMetric, width int) string {
+	value := formatMemoryBytes(metric.value)
+	if metric.text != "" {
+		value += " " + metric.text
+	}
+	labelWidth := max(1, width-10)
+	return fmt.Sprintf("%-*s %9s", labelWidth, ansi.TruncateWc(metric.name, labelWidth, ""), ansi.TruncateWc(value, 9, ""))
+}
+
+func formatMemoryBytes(value uint64) string {
+	units := []string{"B", "K", "M", "G", "T"}
+	amount := float64(value)
+	unit := 0
+	for amount >= 1024 && unit < len(units)-1 {
+		amount /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d%s", value, units[unit])
+	}
+	return fmt.Sprintf("%.1f%s", amount, units[unit])
+}
+
+func batteryGauge(percent int) string {
+	percent = min(100, max(0, percent))
+	const width = 8
+	filled := int(math.Round(float64(percent) * width / 100))
+	color := batteryColor(percent)
+	bar := lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Bold(true).Render("[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]")
+	return fmt.Sprintf("%s %3d%%", bar, percent)
+}
+
+func batteryColor(percent int) string {
+	color := "2"
+	if percent <= 20 {
+		color = "1"
+	} else if percent <= 50 {
+		color = "3"
+	}
+	return color
+}
+
+func displayPower(value float64, available bool) string {
+	if !available {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.2f W", value)
+}
+
+func displayDuration(value time.Duration, available bool) string {
+	if !available {
+		return "N/A"
+	}
+	seconds := int64(value.Seconds())
+	days := seconds / 86400
+	seconds %= 86400
+	if days > 0 {
+		return fmt.Sprintf("%dd %02d:%02d", days, seconds/3600, seconds%3600/60)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", seconds/3600, seconds%3600/60, seconds%60)
+}
+
 func monitorBox(width, height int, title, content string) string {
 	innerWidth := max(1, width-4)
 	innerHeight := max(1, height-2)
@@ -1190,7 +1447,7 @@ func monitorBox(width, height int, title, content string) string {
 	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8")).Padding(0, 1).Width(width).Height(height).MaxWidth(width).MaxHeight(height).Render(title + "\n" + content)
 }
 
-func monitorCPUGPUContent(snapshot systemSnapshot, available bool) string {
+func monitorCPUGPUContent(snapshot systemSnapshot, available bool, chargingSince, lastChargedAt time.Time) string {
 	if !available {
 		return "Collecting system metrics..."
 	}
@@ -1204,11 +1461,60 @@ func monitorCPUGPUContent(snapshot systemSnapshot, available bool) string {
 		}
 	}
 	lines = append(lines, fmt.Sprintf("Load Avg  1m %.2f  5m %.2f  15m %.2f", snapshot.Load1, snapshot.Load5, snapshot.Load15))
-	lines = append(lines, gpuPanel(snapshot))
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("POWER / THERMAL"))
-	lines = append(lines, fmt.Sprintf("Battery %s", displayPercent(snapshot.BatteryPercent, snapshot.BatteryOK)))
-	lines = append(lines, fmt.Sprintf("Temperature %s", displayTemperature(snapshot.TemperatureC, snapshot.TemperatureOK)))
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Bold(true).Render("BATTERY / POWER"))
+	lines = append(lines, monitorBatteryContent(snapshot, chargingSince, lastChargedAt)...)
+	lines = append(lines, fmt.Sprintf("System temp %s", displayTemperature(snapshot.TemperatureC, snapshot.TemperatureOK)))
+	lines = append(lines, "", gpuPanel(snapshot))
 	return strings.Join(lines, "\n")
+}
+
+func monitorBatteryContent(snapshot systemSnapshot, chargingSince, lastChargedAt time.Time) []string {
+	status := snapshot.BatteryStatus
+	if status == "" {
+		status = "Unavailable"
+	}
+	gauge := "Battery N/A"
+	if snapshot.BatteryOK {
+		gauge = batteryGauge(snapshot.BatteryPercent)
+	}
+	power := "--"
+	if snapshot.BatteryStatus == "Charging" {
+		power = strings.TrimSuffix(displayPower(snapshot.BatteryPowerW, snapshot.BatteryPowerOK), " W") + "W"
+	}
+	return []string{
+		gauge,
+		fmt.Sprintf("IN %s | %s", power, status),
+		fmt.Sprintf("Temp %s | ETA %s", strings.ReplaceAll(displayTemperature(snapshot.BatteryTempC, snapshot.BatteryTempOK), " ", ""), compactDuration(snapshot.BatteryTimeLeft, snapshot.BatteryTimeOK)),
+		"Uptime " + compactDuration(snapshot.SystemUptime, snapshot.SystemUptimeOK),
+		"Charged " + lastBatteryChargeText(chargingSince, lastChargedAt),
+	}
+}
+
+func compactDuration(value time.Duration, available bool) string {
+	if !available {
+		return "N/A"
+	}
+	seconds := int64(value.Seconds())
+	days := seconds / 86400
+	hours := seconds % 86400 / 3600
+	minutes := seconds % 3600 / 60
+	if days > 0 {
+		return fmt.Sprintf("%dd%02dh", days, hours)
+	}
+	if seconds >= 3600 {
+		return fmt.Sprintf("%dh%02d", seconds/3600, minutes)
+	}
+	return fmt.Sprintf("%dm", max(0, int(minutes)))
+}
+
+func lastBatteryChargeText(chargingSince, lastChargedAt time.Time) string {
+	if !chargingSince.IsZero() {
+		return "charging since " + chargingSince.Format("15:04")
+	}
+	if !lastChargedAt.IsZero() {
+		return lastChargedAt.Format("02 Jan 15:04")
+	}
+	return "not observed"
 }
 
 func monitorMemoryContent(snapshot systemSnapshot, available bool) string {
@@ -1217,11 +1523,24 @@ func monitorMemoryContent(snapshot systemSnapshot, available bool) string {
 	}
 	used := int(math.Round(float64(snapshot.RAMUsed) / float64(snapshot.RAMTotal) * 100))
 	availablePercent := int(math.Round(float64(snapshot.RAMAvailable) / float64(snapshot.RAMTotal) * 100))
-	cached := int(math.Round(float64(snapshot.RAMCached) / float64(snapshot.RAMTotal) * 100))
-	free := int(math.Round(float64(snapshot.RAMFree) / float64(snapshot.RAMTotal) * 100))
-	return fmt.Sprintf("Used      %3d%% %s\nAvailable %3d%% %s\n\nCached    %3d%% %s\nFree      %3d%% %s",
-		used, progressBar(used, 5), availablePercent, progressBar(availablePercent, 5),
-		cached, progressBar(cached, 5), free, progressBar(free, 5))
+	freePercent := int(math.Round(float64(snapshot.RAMFree) / float64(snapshot.RAMTotal) * 100))
+	lines := []string{
+		fmt.Sprintf("Used %s  %d%%", formatMemoryBytes(snapshot.RAMUsed), used),
+		progressBar(used, 10),
+		fmt.Sprintf("Available %s  %d%%", formatMemoryBytes(snapshot.RAMAvailable), availablePercent),
+		fmt.Sprintf("Free %s  %d%%", formatMemoryBytes(snapshot.RAMFree), freePercent),
+	}
+	if snapshot.Memory.Total > 0 {
+		lines = append(lines,
+			fmt.Sprintf("Cached %s  Buffers %s", formatMemoryBytes(snapshot.Memory.Cached), formatMemoryBytes(snapshot.Memory.Buffers)),
+			fmt.Sprintf("Active %s  Inactive %s", formatMemoryBytes(snapshot.Memory.Active), formatMemoryBytes(snapshot.Memory.Inactive)),
+			fmt.Sprintf("Swap %s  Free %s", formatMemoryBytes(snapshot.Memory.SwapTotal-snapshot.Memory.SwapFree), formatMemoryBytes(snapshot.Memory.SwapFree)),
+			"M: all memory metrics",
+		)
+	} else {
+		lines = append(lines, fmt.Sprintf("Cached %s  Free %s", formatMemoryBytes(snapshot.RAMCached), formatMemoryBytes(snapshot.RAMFree)))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func monitorMemoryTitle(snapshot systemSnapshot, available bool) string {
